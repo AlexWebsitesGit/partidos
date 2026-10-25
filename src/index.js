@@ -4,6 +4,37 @@ function getCookie(request, name) {
   return m ? decodeURIComponent(m[1]) : null;
 }
 
+// Script que se inyecta en la página para reescribir las llamadas del JavaScript
+const shim = (host) => `<script>
+(function(){
+  var HOST = ${JSON.stringify(host)};
+  var P = "/p/" + HOST;
+  function fix(u){
+    try{
+      var abs = new URL(u, location.href);
+      if (abs.hostname === HOST || abs.hostname === location.hostname){
+        if (abs.pathname.indexOf("/p/") !== 0) return P + abs.pathname + abs.search + abs.hash;
+      }
+    }catch(e){}
+    return null;
+  }
+  var _fetch = window.fetch;
+  window.fetch = function(input, init){
+    try{
+      if (typeof input === "string"){ var f = fix(input); if (f) input = f; }
+      else if (input && input.url){ var f2 = fix(input.url); if (f2) input = new Request(f2, input); }
+    }catch(e){}
+    return _fetch.call(this, input, init);
+  };
+  var _open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url){
+    try{ var f = fix(url); if (f) url = f; }catch(e){}
+    var rest = [].slice.call(arguments, 2);
+    return _open.apply(this, [method, url].concat(rest));
+  };
+})();
+</script>`;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -16,8 +47,7 @@ export default {
       host = m[1];
       rest = m[2] || "/";
     } else {
-      // Sin /p/ delante: puede ser uno de tus archivos (index.html)
-      // o una llamada interna del reproductor. Recordamos el sitio en una cookie.
+      // Sin /p/: puede ser tu index.html o una llamada interna del reproductor
       const recordado = getCookie(request, "phost");
       if (recordado) {
         const asset = await env.ASSETS.fetch(request.clone());
@@ -32,7 +62,6 @@ export default {
     const origin = "https://" + host;
     const target = origin + rest + url.search;
 
-    // Cabeceras que reenviamos al sitio original
     const fwd = new Headers();
     for (const h of ["range", "accept", "accept-language", "cookie"]) {
       const v = request.headers.get(h);
@@ -46,7 +75,6 @@ export default {
 
     const resp = await fetch(target, init);
 
-    // Cabeceras de salida
     const setCookies = resp.headers.getSetCookie ? resp.headers.getSetCookie() : [];
     const headers = new Headers(resp.headers);
     headers.delete("set-cookie");
@@ -54,14 +82,15 @@ export default {
     headers.delete("content-security-policy");
     headers.delete("content-security-policy-report-only");
     headers.set("access-control-allow-origin", "*");
+    headers.set("vary", "Cookie");
     for (const c of setCookies) headers.append("Set-Cookie", c);
     headers.append("Set-Cookie", "phost=" + encodeURIComponent(host) + "; Path=/; SameSite=Lax");
 
     const ct = resp.headers.get("content-type") || "";
 
-    // HTML: reescribir enlaces para que no se salgan del proxy
     if (ct.includes("text/html")) {
       return new HTMLRewriter()
+        .on("head", { element(el) { el.prepend(shim(host), { html: true }); } })
         .on("[href],[src]", {
           element(el) {
             for (const a of ["href", "src"]) {
@@ -75,7 +104,6 @@ export default {
         .transform(new Response(resp.body, { status: resp.status, headers }));
     }
 
-    // Listas .m3u8: reescribir también
     if (url.pathname.endsWith(".m3u8") || ct.includes("mpegurl")) {
       let txt = await resp.text();
       txt = txt.replaceAll(origin, "/p/" + host);
